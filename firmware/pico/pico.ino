@@ -1,4 +1,6 @@
-// Raspberry Pi Pico (Arduino-Pico core) -> BLHeli_S ESC throttle + serial REPL
+// Raspberry Pi Pico (Arduino-Pico core) -> ESC throttle (PWM) + serial REPL
+// Sketch for the Pico. The Arduino Uno / Nano version lives in ../uno/uno.ino and speaks the
+// same serial protocol, so the desktop app works with either.
 //
 // Talk to it from the PC app, or from any serial terminal (115200 baud, send "\n" line endings).
 // Type "help" for the command list.
@@ -28,6 +30,18 @@ int      slewPct   = DEF_SLEW_PCT; // max change per 20 ms tick, in % of the sta
 uint32_t timeoutMs = DEF_TIMEOUT_MS; // failsafe: no command/ping for this long -> cut throttle (0 = off)
 bool     debugOn   = false;  // periodic status lines
 
+// Motor direction mode. Normal = unidirectional (0 % = minUs ... 100 % = maxUs). Bidirectional =
+// the ESC is set to "bidirectional/3D" in BLHeli_S: the stop pulse is the PPM *centre*, forward
+// runs centre..PPM max, reverse runs centre..PPM min. The defaults are BLHeli_S's own defaults.
+const int DEF_PPM_MIN = 1148;
+const int DEF_PPM_MAX = 1832;
+const int DEF_PPM_CTR = 1488;
+bool     bidir     = false;
+int      dirSign   = 1;            // +1 forward, -1 reverse (bidirectional only)
+int      ppmMin    = DEF_PPM_MIN;
+int      ppmMax    = DEF_PPM_MAX;
+int      ppmCtr    = DEF_PPM_CTR;
+
 Servo    esc;
 int      targetUs  = minUs;
 int      currentUs = minUs;
@@ -35,12 +49,27 @@ bool     tripped   = false;  // failsafe has fired and is latched until a new th
 uint32_t lastPing = 0, lastTick = 0, lastDebug = 0;
 String   line;
 
-// 0 % -> minUs (off); 1..100 % -> startUs..maxUs linearly
+// The pulse that means "stopped": minUs normally, the PPM centre in bidirectional mode.
+int idleUs() { return bidir ? ppmCtr : minUs; }
+
+// Normal: 0 % -> minUs (off); 1..100 % -> startUs..maxUs linearly.
+// Bidirectional: 0 % -> centre; p % -> centre..max (forward) or centre..min (reverse).
 int pctToUs(int p) {
+  if (bidir) {
+    if (p <= 0) return ppmCtr;
+    if (dirSign > 0) return ppmCtr + (int)((long)(ppmMax - ppmCtr) * p / 100);
+    return ppmCtr - (int)((long)(ppmCtr - ppmMin) * p / 100);
+  }
   if (p <= 0) return minUs;
   return startUs + (long)(maxUs - startUs) * (p - 1) / 99;
 }
 int usToPct(int us) {
+  if (bidir) {                                    // magnitude, 0..100, regardless of direction
+    long span = us >= ppmCtr ? (ppmMax - ppmCtr) : (ppmCtr - ppmMin);
+    long d    = us >= ppmCtr ? (us - ppmCtr)     : (ppmCtr - us);
+    if (span <= 0) return 0;
+    return (int)constrain((d * 100 + span / 2) / span, 0L, 100L);
+  }
   if (us < startUs) return 0;
   long span = maxUs - startUs;
   return constrain(1 + ((long)(us - startUs) * 99 + span / 2) / span, 1, 100);   // rounded, not truncated
@@ -57,7 +86,8 @@ struct Settings {
   uint32_t magic;
   int32_t  minUs, startUs, maxUs, slewPct;
   uint32_t timeoutMs;
-};
+  int32_t  bidir, ppmMin, ppmMax, ppmCtr;   // appended: older saved records fail the range check
+};                                           // below and simply keep the defaults for these fields
 const uint32_t SETTINGS_MAGIC = 0xE5C00001;
 const char    *cfgState = "defaults";   // "defaults" | "flash" | "modified" (changed since load/save)
 
@@ -72,13 +102,19 @@ void loadSettings() {
   if (!ok) return;                      // nothing saved, or data looks corrupt -> keep defaults
   minUs = st.minUs; startUs = st.startUs; maxUs = st.maxUs;
   slewPct = st.slewPct; timeoutMs = st.timeoutMs;
-  targetUs = currentUs = minUs;
+  bool extOk = (st.bidir == 0 || st.bidir == 1)
+            && st.ppmMin >= HARD_MIN_US && st.ppmMin + 50 <= st.ppmCtr
+            && st.ppmCtr + 50 <= st.ppmMax && st.ppmMax <= HARD_MAX_US;
+  if (extOk) { bidir = st.bidir == 1; ppmMin = st.ppmMin; ppmMax = st.ppmMax; ppmCtr = st.ppmCtr; }
+  dirSign = 1;                          // direction never persists - always boot going forward
+  targetUs = currentUs = idleUs();
   cfgState = "flash";
 }
 
 // NB: no function may take/return "Settings" - the Arduino IDE auto-generates prototypes above the struct.
 bool writeSettings(bool valid) {          // valid=false writes a blank record (= "nothing saved")
-  Settings st = { valid ? SETTINGS_MAGIC : 0u, minUs, startUs, maxUs, slewPct, timeoutMs };
+  Settings st = { valid ? SETTINGS_MAGIC : 0u, minUs, startUs, maxUs, slewPct, timeoutMs,
+                  bidir ? 1 : 0, ppmMin, ppmMax, ppmCtr };
   EEPROM.put(0, st);
   return EEPROM.commit();
 }
@@ -90,15 +126,16 @@ void setTarget(int us) {
 }
 
 void cutNow() {                       // immediate stop, no ramp
-  targetUs = currentUs = minUs;
-  esc.writeMicroseconds(minUs);
+  targetUs = currentUs = idleUs();
+  esc.writeMicroseconds(idleUs());
 }
 
 void printStatus(const char *tag) {
   String t = timeoutMs ? String(timeoutMs) + "ms" : String("off");
-  Serial.printf("%s pulse=%dus (%d%%) target=%dus map: 0%%=%dus 1%%=%dus 100%%=%dus slew=%d%%/20ms timeout=%s failsafe=%s cfg=%s\n",
+  Serial.printf("%s pulse=%dus (%d%%) target=%dus map: 0%%=%dus 1%%=%dus 100%%=%dus slew=%d%%/20ms timeout=%s failsafe=%s cfg=%s mode=%s dir=%s ppm=%d,%d,%d board=pico\n",
                 tag, currentUs, usToPct(currentUs), targetUs, minUs, startUs, maxUs,
-                slewPct, t.c_str(), tripped ? "TRIPPED" : "ok", cfgState);
+                slewPct, t.c_str(), tripped ? "TRIPPED" : "ok", cfgState,
+                bidir ? "bidir" : "normal", dirSign > 0 ? "fwd" : "rev", ppmMin, ppmMax, ppmCtr);
 }
 
 void printHelp() {
@@ -108,6 +145,11 @@ void printHelp() {
   Serial.println("  us <800-2200>  set raw pulse width in microseconds (debug)");
   Serial.println("  stop           cut throttle immediately");
   Serial.println("  status         print current state");
+  Serial.println("  dirmode normal|bidir   normal = unidirectional PWM; bidir = ESC set to bidirectional");
+  Serial.println("  dir fwd|rev    bidir only: choose the spin direction (throttle drops to centre first)");
+  Serial.println("  ppmmin <us>    bidir: full-reverse pulse (default 1148)");
+  Serial.println("  ppmmax <us>    bidir: full-forward pulse (default 1832)");
+  Serial.println("  ppmctr <us>    bidir: stop/centre pulse (default 1488)");
   Serial.println("  min <us>       set 0% (off) pulse (default 1000)");
   Serial.println("  start <us>     set 1% pulse = where the motor starts (default 1187)");
   Serial.println("  max <us>       set 100% pulse = where speed stops rising (default 1830)");
@@ -155,6 +197,42 @@ void handleLine(String l) {
     }
     setTarget(v);
     Serial.printf("OK raw pulse target %dus\n", targetUs);
+  } else if (cmd == "dirmode") {
+    if (arg == "normal")                          bidir = false;
+    else if (arg == "bidir" || arg == "bidirectional") bidir = true;
+    else { Serial.println("ERR usage: dirmode normal|bidir"); return; }
+    dirSign = 1;
+    cfgState = "modified";
+    cutNow();
+    Serial.printf("OK dirmode=%s (throttle cut to %dus)\n", bidir ? "bidir" : "normal", idleUs());
+  } else if (cmd == "dir") {
+    if (!bidir) { Serial.println("ERR dir only works in bidirectional mode (dirmode bidir)"); return; }
+    if (arg == "fwd" || arg == "forward")      dirSign = 1;
+    else if (arg == "rev" || arg == "reverse") dirSign = -1;
+    else { Serial.println("ERR usage: dir fwd|rev"); return; }
+    cutNow();                                     // never flip direction under load: back to centre first
+    Serial.printf("OK dir=%s (throttle cut to centre)\n", dirSign > 0 ? "fwd" : "rev");
+  } else if (cmd == "ppmmin") {
+    int v = arg.toInt();
+    if (!isNumber(arg) || v < HARD_MIN_US || v > ppmCtr - 50) {
+      Serial.printf("ERR ppmmin must be %d-%d\n", HARD_MIN_US, ppmCtr - 50); return;
+    }
+    ppmMin = v; cfgState = "modified"; cutNow();
+    Serial.printf("OK ppmmin=%dus (throttle cut)\n", ppmMin);
+  } else if (cmd == "ppmmax") {
+    int v = arg.toInt();
+    if (!isNumber(arg) || v < ppmCtr + 50 || v > HARD_MAX_US) {
+      Serial.printf("ERR ppmmax must be %d-%d\n", ppmCtr + 50, HARD_MAX_US); return;
+    }
+    ppmMax = v; cfgState = "modified"; cutNow();
+    Serial.printf("OK ppmmax=%dus (throttle cut)\n", ppmMax);
+  } else if (cmd == "ppmctr") {
+    int v = arg.toInt();
+    if (!isNumber(arg) || v < ppmMin + 50 || v > ppmMax - 50) {
+      Serial.printf("ERR ppmctr must be %d-%d\n", ppmMin + 50, ppmMax - 50); return;
+    }
+    ppmCtr = v; cfgState = "modified"; cutNow();
+    Serial.printf("OK ppmctr=%dus (throttle cut)\n", ppmCtr);
   } else if (cmd == "stop") {
     cutNow();
     tripped  = false;
@@ -216,7 +294,10 @@ void handleLine(String l) {
     cutNow();
     minUs = DEF_MIN_US; startUs = DEF_START_US; maxUs = DEF_MAX_US;
     slewPct = DEF_SLEW_PCT; timeoutMs = DEF_TIMEOUT_MS;
-    targetUs = currentUs = minUs;
+    bidir = false; dirSign = 1;
+    ppmMin = DEF_PPM_MIN; ppmMax = DEF_PPM_MAX; ppmCtr = DEF_PPM_CTR;
+    targetUs = currentUs = idleUs();
+    esc.writeMicroseconds(idleUs());
     writeSettings(false);                       // magic = 0 -> treated as "nothing saved"
     cfgState = "defaults";
     Serial.println("OK factory defaults restored, saved settings erased");
@@ -246,9 +327,10 @@ void handleLine(String l) {
 void setup() {
   Serial.begin(115200);
   EEPROM.begin(256);
+  loadSettings();                         // saved values (if any) replace the defaults - done BEFORE attach,
+                                          // so the first pulse is already the right idle pulse
   esc.attach(ESC_PIN, 500, 2500);         // wide library limits; we enforce our own
-  loadSettings();                         // saved values (if any) replace the defaults
-  esc.writeMicroseconds(minUs);           // arm: hold minimum throttle
+  esc.writeMicroseconds(idleUs());        // arm: hold minimum throttle (normal) or centre (bidirectional)
   delay(3000);                            // let the ESC finish its startup beeps
   lastPing = millis();
 }
@@ -264,19 +346,25 @@ void loop() {
   }
 
   if (timeoutMs && !tripped && millis() - lastPing > timeoutMs &&
-      (targetUs != minUs || currentUs != minUs)) {
-    targetUs = minUs;
+      (targetUs != idleUs() || currentUs != idleUs())) {
+    targetUs = idleUs();
     tripped  = true;
     Serial.printf("WARN failsafe: nothing received for %lums, throttle cut\n", (unsigned long)timeoutMs);
   }
 
   if (millis() - lastTick >= 20) {
     lastTick = millis();
-    int step = max(1, (maxUs - startUs) * slewPct / 100);
-    if (targetUs >= startUs && currentUs < startUs)        currentUs = startUs;
-    else if (targetUs == minUs && currentUs <= startUs)    currentUs = minUs;
-    else if (currentUs < targetUs)                         currentUs = min(currentUs + step, targetUs);
-    else if (currentUs > targetUs)                         currentUs = max(currentUs - step, targetUs);
+    int span = bidir ? max(ppmMax - ppmCtr, ppmCtr - ppmMin) : (maxUs - startUs);
+    int step = max(1, span * slewPct / 100);
+    if (bidir) {                                  // plain linear ramp around the centre
+      if (currentUs < targetUs)      currentUs = min(currentUs + step, targetUs);
+      else if (currentUs > targetUs) currentUs = max(currentUs - step, targetUs);
+    } else {
+      if (targetUs >= startUs && currentUs < startUs)        currentUs = startUs;
+      else if (targetUs == minUs && currentUs <= startUs)    currentUs = minUs;
+      else if (currentUs < targetUs)                         currentUs = min(currentUs + step, targetUs);
+      else if (currentUs > targetUs)                         currentUs = max(currentUs - step, targetUs);
+    }
     esc.writeMicroseconds(currentUs);
   }
 

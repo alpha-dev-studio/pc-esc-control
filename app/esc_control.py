@@ -1,4 +1,4 @@
-"""ESC Control - desktop app for the Pico BLHeli_S throttle firmware.
+"""ESC Control - desktop app for the Pico / Arduino Uno ESC throttle firmware.
 
     python esc_control.py [--port COM5]
 
@@ -15,8 +15,9 @@ import serial
 import serial.tools.list_ports
 
 BAUD = 115200
-PING_INTERVAL = 0.1            # heartbeat; the Pico cuts throttle if it hears nothing for 1 s
+PING_INTERVAL = 0.1            # heartbeat; the board cuts throttle if it hears nothing for 1 s
 PICO_VID = 0x2E8A
+SETTLE_NON_PICO = 2.6          # Arduino Uno/Nano auto-reset when the port opens; wait out the bootloader
 HARD_MIN, HARD_MAX = 800, 2200  # absolute pulse limits enforced by the firmware
 
 C = dict(
@@ -28,6 +29,8 @@ C = dict(
 STATUS_RE = re.compile(
     r"pulse=(\d+)us \((\d+)%\) target=(\d+)us map: 0%=(\d+)us 1%=(\d+)us 100%=(\d+)us "
     r"slew=(\d+)%/20ms timeout=(\w+) failsafe=(\w+)(?: cfg=(\w+))?"
+    r"(?: mode=(\w+) dir=(\w+) ppm=(\d+),(\d+),(\d+))?"
+    r"(?: board=(\w+))?"
 )
 
 GUI_HELP = """Local commands:
@@ -36,10 +39,37 @@ GUI_HELP = """Local commands:
   disconnect          stop motor and close the port
   clear               wipe this console
   quit / exit         stop motor and close the app
-Anything else goes straight to the Pico. Try:  help | status | s 20 | us 1100 | stop | save"""
+Anything else goes straight to the board. Try:  help | status | s 20 | us 1100 | stop | save"""
 
 
 # ----------------------------------------------------------------------------- helpers
+
+# Names shown in the UI for each board the firmware can run on.
+BOARDS = {
+    "pico": dict(name="Pico", full="Raspberry Pi Pico", store="flash"),
+    "uno":  dict(name="Uno",  full="Arduino Uno / Nano", store="EEPROM"),
+}
+
+
+def guess_board(port):
+    """Best guess at which board is on `port` from its USB ID, before we've talked to it.
+    The Pico has native USB (VID 0x2E8A). Anything else with a USB ID is assumed to be an Arduino
+    behind a USB-serial chip (Arduino, CH340, FTDI, CP210x...). Returns "pico", "uno" or None.
+    The firmware reports the real answer in its status line (board=...), which overrides this."""
+    for p in serial.tools.list_ports.comports():
+        if p.device == port:
+            if p.vid is None:
+                return None
+            return "pico" if p.vid == PICO_VID else "uno"
+    return None
+
+
+def board_settle(port):
+    """Seconds to wait after opening `port` before talking to it. The Pico (native USB) needs
+    none; an Uno/Nano auto-resets when the port opens and ignores serial while its bootloader
+    runs. Unknown ports get none."""
+    return SETTLE_NON_PICO if guess_board(port) == "uno" else 0.0
+
 
 def list_ports():
     """Serial ports as (device, description), Pico first."""
@@ -53,14 +83,49 @@ def parse_status(line):
     if not m:
         return None
     g = m.groups()
-    return dict(pulse=int(g[0]), pct=int(g[1]), target=int(g[2]),
-                mn=int(g[3]), st=int(g[4]), mx=int(g[5]), slew=int(g[6]),
-                timeout=g[7], failsafe=g[8], cfg=g[9])
+    d = dict(pulse=int(g[0]), pct=int(g[1]), target=int(g[2]),
+             mn=int(g[3]), st=int(g[4]), mx=int(g[5]), slew=int(g[6]),
+             timeout=g[7], failsafe=g[8], cfg=g[9],
+             bidir=(g[10] == "bidir"), dir=(g[11] or "fwd"), board=g[15])
+    if g[12] is not None:                     # firmware older than the bidirectional update: keep defaults
+        d.update(pmin=int(g[12]), pmax=int(g[13]), pctr=int(g[14]))
+    return d
 
 
 def pct_to_us(p, mn, st, mx):
     """Same mapping as the firmware: 0 % -> off pulse, 1..100 % -> start..max."""
     return mn if p <= 0 else st + (mx - st) * (p - 1) // 99
+
+
+def throttle_to_us(p, c, direction):
+    """Same mapping as the firmware, for either motor-direction mode. `c` is the board_st settings dict."""
+    if c.get("bidir"):
+        if p <= 0:
+            return c["pctr"]
+        if direction == "rev":
+            return c["pctr"] - (c["pctr"] - c["pmin"]) * p // 100
+        return c["pctr"] + (c["pmax"] - c["pctr"]) * p // 100
+    return pct_to_us(p, c["mn"], c["st"], c["mx"])
+
+
+def ppm_valid(pmin, pctr, pmax):
+    return HARD_MIN <= pmin and pmin + 50 <= pctr and pctr + 50 <= pmax and pmax <= HARD_MAX
+
+
+def safe_order_ppm(cur, new):
+    """Order in which to send ppmmin/ppmctr/ppmmax so every intermediate state is valid."""
+    changed = [k for k in ("pmin", "pctr", "pmax") if new[k] != cur[k]]
+    for perm in itertools.permutations(changed):
+        s = dict(pmin=cur["pmin"], pctr=cur["pctr"], pmax=cur["pmax"])
+        ok = True
+        for k in perm:
+            s[k] = new[k]
+            if not ppm_valid(s["pmin"], s["pctr"], s["pmax"]):
+                ok = False
+                break
+        if ok:
+            return list(perm)
+    return changed
 
 
 def cal_valid(mn, st, mx):
@@ -93,13 +158,15 @@ class Link:
         self.ser = None
         self._stop = threading.Event()
         self._wlock = threading.Lock()
+        self.ready_at = 0.0
 
-    def connect(self, port):
+    def connect(self, port, settle=0.0):
         self.disconnect()
         self.ser = serial.Serial(port, BAUD, timeout=0.1)
+        self.ready_at = time.time() + settle
         self._stop = threading.Event()
         threading.Thread(target=self._reader, args=(self.ser, self._stop), daemon=True).start()
-        threading.Thread(target=self._heartbeat, args=(self._stop,), daemon=True).start()
+        threading.Thread(target=self._heartbeat, args=(self._stop, settle), daemon=True).start()
 
     def disconnect(self):
         ser = self.ser
@@ -122,6 +189,8 @@ class Link:
         ser = self.ser
         if not ser:
             raise IOError("not connected")
+        if time.time() < self.ready_at:
+            raise IOError("board is still resetting")
         with self._wlock:
             ser.write((text.strip() + "\n").encode())
 
@@ -143,7 +212,9 @@ class Link:
                 raw, buf = buf.split(b"\n", 1)
                 self.on_line(raw.decode(errors="replace").rstrip("\r"))
 
-    def _heartbeat(self, stop):
+    def _heartbeat(self, stop, settle=0.0):
+        if settle and stop.wait(settle):
+            return
         while not stop.is_set():
             try:
                 self.send("ping")
@@ -212,9 +283,24 @@ def run_gui(port=None):
                       activebackground=hover, activeforeground=fg, relief="flat", bd=0,
                       padx=S(padx), pady=S(pady), cursor="hand2", font=font or FONT,
                       highlightthickness=0)
-        b.bind("<Enter>", lambda e: b.config(bg=hover))
-        b.bind("<Leave>", lambda e: b.config(bg=bg))
+        b._rest = bg                      # the colour the button returns to when the mouse leaves
+
+        def on_enter(e):
+            if str(b.cget("state")) != "disabled":
+                b.config(bg=hover)
+
+        def on_leave(e):
+            b.config(bg=b._rest)
+        b.bind("<Enter>", on_enter)
+        b.bind("<Leave>", on_leave)
         return b
+
+    def set_rest(b, color, fg=None):
+        """Recolour a button for good (a plain config(bg=) is undone the next time the mouse leaves it)."""
+        b._rest = color
+        b.config(bg=color)
+        if fg is not None:
+            b.config(fg=fg)
 
     def make_entry(parent, var, width=8):
         return tk.Entry(parent, textvariable=var, width=width, bg=C["panel2"], fg=C["fg"],
@@ -233,11 +319,12 @@ def run_gui(port=None):
     # ---- state
     q = queue.Queue()
     link = Link(lambda l: q.put(l))
-    pico = dict(pulse=None, pct=0, target=None, mn=1000, st=1187, mx=1830, slew=1,
-                timeout="1000ms", failsafe="ok", cfg=None)
+    board_st = dict(pulse=None, pct=0, target=None, mn=1000, st=1187, mx=1830, slew=1,
+                timeout="1000ms", failsafe="ok", cfg=None,
+                bidir=False, dir="fwd", pmin=1148, pmax=1832, pctr=1488)
     state = dict(throttle=0, last_sent=None, sync=False, have_status=False, last_rx=0.0,
                  banner_kind="", history=[], hidx=0, shown_conn=None, hint_shown=False,
-                 ramp_dir=0, ramp_job=None)
+                 ramp_dir=0, ramp_job=None, seen_mode=None, raw_shown=True, board=None, board_logged=False, board_painted=False)
 
     # ========================================================================= header
     header = tk.Frame(root, bg=C["bg"])
@@ -247,8 +334,8 @@ def run_gui(port=None):
     title_box.pack(side="left")
     tk.Label(title_box, text="ESC Control", bg=C["bg"], fg=C["fg"],
              font=("Segoe UI", 16, "bold")).pack(anchor="w")
-    tk.Label(title_box, text="Raspberry Pi Pico \u2192 BLHeli_S", bg=C["bg"], fg=C["dim"],
-             font=FONT_S).pack(anchor="w")
+    subtitle_lbl = tk.Label(title_box, text="", bg=C["bg"], fg=C["dim"], font=FONT_S)
+    subtitle_lbl.pack(anchor="w")
 
     conn_box = tk.Frame(header, bg=C["bg"])
     conn_box.pack(side="right")
@@ -256,7 +343,7 @@ def run_gui(port=None):
     dot_id = dot.create_oval(S(2), S(2), S(12), S(12), fill=C["dim"], outline="")
     dot.pack(side="left", padx=(0, S(6)))
     conn_lbl = tk.Label(conn_box, text="Disconnected", bg=C["bg"], fg=C["dim"], font=FONT,
-                        width=18, anchor="w")
+                        width=30, anchor="w")
     conn_lbl.pack(side="left", padx=(0, S(10)))
     port_var = tk.StringVar()
     port_box = ttk.Combobox(conn_box, textvariable=port_var, width=10, state="readonly", font=FONT)
@@ -338,6 +425,14 @@ def run_gui(port=None):
     slider = ThrottleSlider(t_in, lambda v: set_throttle(v, user=True))
     slider.pack(fill="x", pady=(S(6), S(4)))
 
+    # direction buttons: only unlocked when the motor direction is set to Bidirectional
+    dir_row = tk.Frame(t_in, bg=C["panel"])
+    dir_row.pack(fill="x", pady=(S(0), S(6)))
+    rev_btn = make_button(dir_row, "\u25c0  REVERSE", lambda: set_direction("rev"), font=FONT_B, pady=7)
+    rev_btn.pack(side="left", fill="x", expand=True, padx=(0, S(4)))
+    fwd_btn = make_button(dir_row, "FORWARD  \u25b6", lambda: set_direction("fwd"), font=FONT_B, pady=7)
+    fwd_btn.pack(side="left", fill="x", expand=True, padx=(S(4), 0))
+
     step_row = tk.Frame(t_in, bg=C["panel"])
     step_row.pack(pady=(S(2), S(8)))
     for delta, txt in ((-5, "\u22125"), (-1, "\u22121"), (1, "+1"), (5, "+5")):
@@ -381,6 +476,16 @@ def run_gui(port=None):
     c_outer, c_in = make_card(main, "CALIBRATION")
     c_outer.grid(row=0, column=1, sticky="nsew", padx=(S(8), 0))
 
+    mode_row = tk.Frame(c_in, bg=C["panel"])
+    mode_row.pack(fill="x", pady=(0, S(8)))
+    tk.Label(mode_row, text="Motor direction", bg=C["panel"], fg=C["fg"], font=FONT, anchor="w"
+             ).pack(side="left")
+    mode_var = tk.StringVar(value="Normal")
+    mode_box = ttk.Combobox(mode_row, textvariable=mode_var, values=("Normal", "Bidirectional"),
+                            width=14, state="readonly", font=FONT)
+    mode_box.pack(side="right")
+    mode_box.bind("<<ComboboxSelected>>", lambda e: change_dirmode())
+
     cfg_lbl = tk.Label(c_in, text="", bg=C["panel"], fg=C["dim"], font=FONT_S, anchor="w")
     cfg_lbl.pack(fill="x", pady=(0, S(6)))
 
@@ -388,27 +493,37 @@ def run_gui(port=None):
     grid.pack(fill="x")
     grid.columnconfigure(0, weight=1)
     vars_ = dict(mn=tk.StringVar(), st=tk.StringVar(), mx=tk.StringVar(),
+                 pmin=tk.StringVar(), pctr=tk.StringVar(), pmax=tk.StringVar(),
                  slew=tk.StringVar(), to=tk.StringVar())
+    # Off/Start/Max drive Normal mode; the three PPM rows drive Bidirectional mode. Whichever set
+    # doesn't apply to the current motor direction is greyed out (see update_mode_ui).
     rows = (("mn", "Off  (0 %)", "\u00b5s"), ("st", "Start  (1 %)", "\u00b5s"),
-            ("mx", "Max  (100 %)", "\u00b5s"), ("slew", "Ramp limit", "% / 20 ms"),
-            ("to", "Failsafe", "ms  (0 = off)"))
+            ("mx", "Max  (100 %)", "\u00b5s"),
+            ("pmin", "PPM min  (full rev)", "\u00b5s"), ("pctr", "PPM centre  (stop)", "\u00b5s"),
+            ("pmax", "PPM max  (full fwd)", "\u00b5s"),
+            ("slew", "Ramp limit", "% / 20 ms"), ("to", "Failsafe", "ms  (0 = off)"))
+    row_widgets = {}
     for i, (key, label, unit) in enumerate(rows):
-        tk.Label(grid, text=label, bg=C["panel"], fg=C["fg"], font=FONT, anchor="w"
-                 ).grid(row=i, column=0, sticky="w", pady=S(3))
-        make_entry(grid, vars_[key]).grid(row=i, column=1, padx=S(8), pady=S(3))
-        tk.Label(grid, text=unit, bg=C["panel"], fg=C["dim"], font=FONT_S, anchor="w", width=13
-                 ).grid(row=i, column=2, sticky="w")
+        lab = tk.Label(grid, text=label, bg=C["panel"], fg=C["fg"], font=FONT, anchor="w")
+        lab.grid(row=i, column=0, sticky="w", pady=S(3))
+        ent = make_entry(grid, vars_[key])
+        ent.grid(row=i, column=1, padx=S(8), pady=S(3))
+        unl = tk.Label(grid, text=unit, bg=C["panel"], fg=C["dim"], font=FONT_S, anchor="w", width=13)
+        unl.grid(row=i, column=2, sticky="w")
+        row_widgets[key] = (lab, ent, unl)
 
     btn_row = tk.Frame(c_in, bg=C["panel"])
     btn_row.pack(fill="x", pady=(S(10), S(4)))
     make_button(btn_row, "Apply", lambda: apply_cal(), kind="accent", font=FONT_B).pack(side="left")
     make_button(btn_row, "Read", lambda: read_cal()).pack(side="left", padx=S(6))
-    make_button(btn_row, "Save to Pico", lambda: save_cal()).pack(side="left")
+    save_btn = make_button(btn_row, "Save to board", lambda: save_cal())
+    save_btn.pack(side="left")
     make_button(btn_row, "Defaults", lambda: defaults_cal(), kind="ghost").pack(side="right")
 
-    tk.Frame(c_in, bg=C["line"], height=1).pack(fill="x", pady=S(10))
-    tk.Label(c_in, text="Raw pulse test", bg=C["panel"], fg=C["dim"], font=FONT_B, anchor="w"
-             ).pack(fill="x")
+    raw_sep = tk.Frame(c_in, bg=C["line"], height=1)
+    raw_sep.pack(fill="x", pady=S(10))
+    raw_title = tk.Label(c_in, text="Raw pulse test", bg=C["panel"], fg=C["dim"], font=FONT_B, anchor="w")
+    raw_title.pack(fill="x")
     raw_row = tk.Frame(c_in, bg=C["panel"])
     raw_row.pack(fill="x", pady=(S(4), 0))
     raw_var = tk.StringVar(value="1187")
@@ -496,26 +611,31 @@ def run_gui(port=None):
 
     def refresh_readouts():
         v = state["throttle"]
-        pct_lbl.config(text=str(v))
-        tgt = pct_to_us(v, pico["mn"], pico["st"], pico["mx"])
-        if link.ser and state["have_status"] and pico["pulse"] is not None:
-            detail_lbl.config(text=f"target {tgt} \u00b5s     actual {pico['pulse']} \u00b5s")
-            slider.actual = pico["pct"]
+        bidir = bool(board_st.get("bidir"))
+        rev = bidir and board_st.get("dir") == "rev"
+        pct_lbl.config(text=("\u2212" if (rev and v > 0) else "") + str(v))
+        tgt = throttle_to_us(v, board_st, board_st.get("dir"))
+        unit = " \u00b5s"
+        lead = ("REVERSE     " if rev else "FORWARD     ") if bidir else ""
+        if link.ser and state["have_status"] and board_st["pulse"] is not None:
+            detail_lbl.config(text=f"{lead}target {tgt}{unit}     actual {board_st['pulse']}{unit}")
+            slider.actual = board_st["pct"]
         else:
-            detail_lbl.config(text=f"target {tgt} \u00b5s     " + ("waiting for Pico\u2026" if link.ser else "not connected"))
+            detail_lbl.config(text=f"{lead}target {tgt}{unit}     " + (f"waiting for {bname()}\u2026" if link.ser else "not connected"))
             slider.actual = None
         slider.value = v
         slider.draw()
+        update_mode_ui()
 
     def set_throttle(v, user=False):
         vf = max(0.0, min(100.0, float(v)))
-        state["throttle_f"] = vf
         v = int(round(vf))
+        state["throttle_f"] = vf
         state["throttle"] = v
         if user:
             if not link.ser:
                 if not state["hint_shown"]:
-                    set_banner("Not connected \u2013 connect to the Pico to send throttle.", "info")
+                    set_banner(f"Not connected \u2013 connect to the {bname()} to send throttle.", "info")
                     state["hint_shown"] = True
             elif v != state["last_sent"]:
                 if send(str(v), echo=False):
@@ -527,7 +647,7 @@ def run_gui(port=None):
     def do_stop():
         stop_ramp()
         if link.ser:
-            send("stop")
+            send("stop", echo=False)
         state["last_sent"] = 0
         set_banner("")
         set_throttle(0)
@@ -547,7 +667,7 @@ def run_gui(port=None):
     def start_ramp(direction):
         if not link.ser:
             if not state["hint_shown"]:
-                set_banner("Not connected \u2013 connect to the Pico to send throttle.", "info")
+                set_banner(f"Not connected \u2013 connect to the {bname()} to send throttle.", "info")
                 state["hint_shown"] = True
             return
         if state["ramp_job"] is not None:
@@ -565,22 +685,129 @@ def run_gui(port=None):
         ramp_up_btn.config(bg=C["panel2"])
         ramp_dn_btn.config(bg=C["panel2"])
 
+    def bname():
+        """Short name of the connected board for messages: 'Pico', 'Uno', or 'board' if unknown."""
+        return BOARDS[state["board"]]["name"] if state["board"] in BOARDS else "board"
+
     def update_cfg_badge():
-        cfg = pico.get("cfg")
+        cfg = board_st.get("cfg")
+        saved = (f"Saved in {bname()} {BOARDS[state['board']]['store']}"
+                 if state["board"] in BOARDS else "Saved on the board")
         text, color = {
-            "flash": ("\u25cf  Saved in Pico flash", C["ok"]),
+            "flash": (f"\u25cf  {saved}", C["ok"]),
             "defaults": ("\u25cf  Factory defaults (nothing saved)", C["dim"]),
-            "modified": ("\u25cf  Unsaved changes on the Pico", C["warn"]),
+            "modified": (f"\u25cf  Unsaved changes on the {bname()}", C["warn"]),
         }.get(cfg, ("", C["dim"]))
         cfg_lbl.config(text=text, fg=color)
 
+    def set_board(kind, confirmed=False):
+        """Record which board we're talking to and refresh every piece of text that names it."""
+        if kind == state["board"] and state["board_painted"] and (not confirmed or state["board_logged"]):
+            return                          # nothing new - don't repaint on every status tick
+        state["board_painted"] = True
+        changed = kind != state["board"]
+        state["board"] = kind if kind in BOARDS else None
+        if kind in BOARDS:
+            subtitle_lbl.config(text=f"{BOARDS[kind]['full']} \u2192 ESC (PWM)")
+        else:
+            subtitle_lbl.config(text="Raspberry Pi Pico or Arduino Uno \u2192 ESC (PWM)")
+        save_btn.config(text=f"Save to {bname()}")
+        update_cfg_badge()
+        update_conn_ui()
+        if confirmed and kind in BOARDS and not state["board_logged"]:
+            state["board_logged"] = True
+            log(f"[detected: {BOARDS[kind]['full']}]", "info")
+        elif changed:
+            refresh_readouts()
+
     def fill_entries():
-        vars_["mn"].set(str(pico["mn"]))
-        vars_["st"].set(str(pico["st"]))
-        vars_["mx"].set(str(pico["mx"]))
-        vars_["slew"].set(str(pico["slew"]))
-        to = pico["timeout"]
+        for k in ("mn", "st", "mx", "pmin", "pctr", "pmax", "slew"):
+            vars_[k].set(str(board_st[k]))
+        to = board_st["timeout"]
         vars_["to"].set("0" if to == "off" else to.replace("ms", ""))
+        update_mode_ui(force=True)
+
+    def lock_row(key, locked):
+        lab, ent, unl = row_widgets[key]
+        if locked:
+            ent.config(state="disabled", disabledbackground=C["panel"], disabledforeground="#59616f")
+            lab.config(fg="#59616f")
+            unl.config(fg="#59616f")
+        else:
+            ent.config(state="normal")
+            lab.config(fg=C["fg"])
+            unl.config(fg=C["dim"])
+
+    def update_mode_ui(force=False):
+        """Sync the motor-direction dropdown, which calibration rows are unlocked, and the
+        FORWARD/REVERSE buttons with what the board last reported."""
+        bidir = bool(board_st.get("bidir"))
+        if force or state["seen_mode"] != bidir:
+            mode_var.set("Bidirectional" if bidir else "Normal")
+        state["seen_mode"] = bidir
+        usable = bidir and bool(link.ser)
+        direction = board_st.get("dir")
+        sig = (bidir, usable, direction)
+        if not force and state.get("mode_sig") == sig:
+            return                           # nothing changed - don't touch widgets (keeps hover highlights)
+        state["mode_sig"] = sig
+        # The raw pulse test only makes sense in Normal mode - hide it in Bidirectional.
+        if bidir and state["raw_shown"]:
+            for w in (raw_sep, raw_title, raw_row):
+                w.pack_forget()
+            state["raw_shown"] = False
+        elif not bidir and not state["raw_shown"]:
+            raw_sep.pack(fill="x", pady=S(10))
+            raw_title.pack(fill="x")
+            raw_row.pack(fill="x", pady=(S(4), 0))
+            state["raw_shown"] = True
+        for k in ("pmin", "pctr", "pmax"):
+            lock_row(k, not bidir)
+        for k in ("mn", "st", "mx"):
+            lock_row(k, bidir)
+        for btn, name in ((fwd_btn, "fwd"), (rev_btn, "rev")):
+            btn.config(state="normal" if usable else "disabled",
+                       cursor="hand2" if usable else "arrow",
+                       disabledforeground="#59616f")
+            if usable and direction == name:
+                set_rest(btn, C["accent"], fg="#06121f")
+            else:
+                set_rest(btn, C["panel2"] if usable else C["panel"], fg=C["fg"])
+
+    def change_dirmode():
+        target = "bidir" if mode_var.get() == "Bidirectional" else "normal"
+        if not link.ser:
+            log("[not connected]", "err")
+            update_mode_ui(force=True)
+            return
+        if target == ("bidir" if board_st.get("bidir") else "normal"):
+            return
+        if target == "normal" and not messagebox.askyesno(
+                "Switch to Normal mode?",
+                "Normal mode idles at the 'Off' pulse (about 1000 \u00b5s). An ESC that is set to "
+                "BIDIRECTIONAL reads that as FULL REVERSE.\n\nOnly continue if the ESC itself is "
+                "set to normal (unidirectional) rotation, and keep the propeller off.\n\nSwitch to Normal?"):
+            update_mode_ui(force=True)
+            return
+        stop_ramp()
+        set_throttle(0)
+        state["last_sent"] = 0
+        send(f"dirmode {target}")
+        request_status(sync=True)
+
+    def set_direction(d):
+        if not need_link():
+            return
+        if not board_st.get("bidir"):
+            log("[direction buttons need Motor direction = Bidirectional]", "err")
+            return
+        stop_ramp()
+        set_throttle(0)                      # the firmware drops to centre before flipping direction
+        state["last_sent"] = 0
+        board_st["dir"] = d
+        send(f"dir {d}")
+        update_mode_ui()
+        refresh_readouts()
 
     def request_status(sync=True):
         state["sync"] = sync
@@ -590,9 +817,11 @@ def run_gui(port=None):
         if link.ser:
             waiting = time.time() - state["last_rx"] > 3.0 and state["have_status"]
             if waiting:
-                color, text = C["warn"], "No data from Pico"
+                color, text = C["warn"], f"No data from {bname()}"
             else:
                 color, text = C["ok"], f"Connected  {port_var.get()}"
+                if state["board"] in BOARDS:
+                    text += f"  \u00b7  {bname()}"
         else:
             color, text = (C["bad"], detail) if detail else (C["dim"], "Disconnected")
         dot.itemconfig(dot_id, fill=color)
@@ -602,27 +831,40 @@ def run_gui(port=None):
 
     def do_connect(target):
         if not target:
-            log("[no serial ports found \u2013 plug in the Pico and press \u21bb]", "err")
+            log("[no serial ports found \u2013 plug the board in and press \u21bb]", "err")
             return
+        settle = board_settle(target)
         try:
-            link.connect(target)
+            link.connect(target, settle)
         except Exception as e:
             log(f"[connect failed: {e}]", "err")
             update_conn_ui("Connect failed")
             return
         port_var.set(target)
-        state.update(last_sent=None, have_status=False, last_rx=time.time(), hint_shown=False)
+        state.update(last_sent=None, have_status=False, last_rx=time.time() + settle, hint_shown=False,
+                     board_logged=False)
+        set_board(guess_board(target))      # a first guess from the USB ID; the firmware confirms below
         set_banner("")
         log(f"[connected to {target}]", "info")
-        send("debug on", echo=False)
-        request_status(sync=True)
+        if settle:
+            log(f"[this board resets when the port opens - waiting {settle:.1f}s before talking to it]", "info")
+
+            def finish_connect():
+                if link.ser:
+                    send("debug on", echo=False)
+                    request_status(sync=True)
+            root.after(int(settle * 1000) + 100, finish_connect)
+        else:
+            send("debug on", echo=False)
+            request_status(sync=True)
         update_conn_ui()
         refresh_readouts()
 
     def do_disconnect(msg="[disconnected]"):
         link.disconnect()
         state.update(have_status=False, last_sent=None)
-        pico.update(pulse=None, pct=0, failsafe="ok")
+        board_st.update(pulse=None, pct=0, failsafe="ok")
+        set_board(None)
         set_banner("")
         set_throttle(0)
         log(msg, "info")
@@ -653,14 +895,21 @@ def run_gui(port=None):
     def apply_cal():
         if not need_link():
             return
+        bidir = bool(board_st.get("bidir"))
+        keys = ("pmin", "pctr", "pmax") if bidir else ("mn", "st", "mx")
         try:
-            new = dict(mn=int(vars_["mn"].get()), st=int(vars_["st"].get()),
-                       mx=int(vars_["mx"].get()), slew=int(vars_["slew"].get()),
-                       to=int(vars_["to"].get()))
+            new = dict(slew=int(vars_["slew"].get()), to=int(vars_["to"].get()))
+            for k in keys:
+                new[k] = int(vars_[k].get())
         except ValueError:
             log("[calibration: enter whole numbers only]", "err")
             return
-        if not cal_valid(new["mn"], new["st"], new["mx"]):
+        if bidir:
+            if not ppm_valid(new["pmin"], new["pctr"], new["pmax"]):
+                log(f"[calibration: need {HARD_MIN} \u2264 PPM min, min+50 \u2264 centre, "
+                    f"centre+50 \u2264 max, max \u2264 {HARD_MAX}]", "err")
+                return
+        elif not cal_valid(new["mn"], new["st"], new["mx"]):
             log(f"[calibration: need {HARD_MIN} \u2264 off < start \u2264 max\u221250, max \u2264 {HARD_MAX}]", "err")
             return
         if not 1 <= new["slew"] <= 100:
@@ -669,15 +918,19 @@ def run_gui(port=None):
         if not (new["to"] == 0 or 200 <= new["to"] <= 60000):
             log("[calibration: failsafe must be 0 or 200\u201360000 ms]", "err")
             return
-        cur_to = 0 if pico["timeout"] == "off" else int(pico["timeout"].replace("ms", ""))
-        names = dict(mn="min", st="start", mx="max")
-        order = safe_order(pico, new)
+        cur_to = 0 if board_st["timeout"] == "off" else int(board_st["timeout"].replace("ms", ""))
+        if bidir:
+            names = dict(pmin="ppmmin", pctr="ppmctr", pmax="ppmmax")
+            order = safe_order_ppm(board_st, new)
+        else:
+            names = dict(mn="min", st="start", mx="max")
+            order = safe_order(board_st, new)
         if order:
-            set_throttle(0)          # firmware cuts throttle whenever min/start/max change
+            set_throttle(0)          # firmware cuts throttle whenever these values change
             state["last_sent"] = 0
         for k in order:
             send(f"{names[k]} {new[k]}")
-        if new["slew"] != pico["slew"]:
+        if new["slew"] != board_st["slew"]:
             send(f"slew {new['slew']}")
         if new["to"] != cur_to:
             send(f"timeout {new['to']}")
@@ -692,7 +945,7 @@ def run_gui(port=None):
 
     def defaults_cal():
         if need_link() and messagebox.askyesno(
-                "Factory defaults", "Restore factory values and erase what is saved on the Pico?"):
+                "Factory defaults", f"Restore factory values and erase what is saved on the {bname()}?"):
             set_throttle(0)
             state["last_sent"] = 0
             send("defaults")
@@ -762,8 +1015,22 @@ def run_gui(port=None):
             log(GUI_HELP, "info")
             if link.ser:
                 send(text, echo=False)
+        elif cmd.isdigit() and len(parts) == 1:
+            # bare "<0-100>" - route through set_throttle so the on-screen slider/readout
+            # stay in sync, instead of a raw send.
+            set_throttle(int(cmd), user=True)
+        elif cmd == "s" and len(parts) == 2 and parts[1].isdigit():
+            set_throttle(int(parts[1]), user=True)
+            log(f"OK throttle {int(parts[1])}%", "ok")
+        elif cmd == "stop":
+            do_stop()
         else:
-            if send(text, echo=False) and cmd in ("min", "start", "max", "slew", "timeout", "save", "defaults", "arm"):
+            if send(text, echo=False) and cmd in ("min", "start", "max", "slew", "timeout", "save",
+                                                  "defaults", "dirmode", "dir", "ppmmin", "ppmmax", "ppmctr"):
+                if cmd not in ("slew", "timeout"):   # these all cut throttle on the board: mirror that locally
+                    stop_ramp()
+                    set_throttle(0)
+                    state["last_sent"] = 0
                 request_status(sync=True)
 
     def hist(delta):
@@ -809,8 +1076,10 @@ def run_gui(port=None):
         state["last_rx"] = time.time()
         st = parse_status(l)
         if st:
-            pico.update(st)
+            board_st.update(st)
             state["have_status"] = True
+            if st.get("board") in BOARDS:   # the firmware itself says what it is - trust that over the USB-ID guess
+                set_board(st["board"], confirmed=True)
             if state["sync"]:
                 fill_entries()
                 state["sync"] = False
@@ -867,10 +1136,10 @@ def run_gui(port=None):
     refresh_ports()
     if port:
         port_var.set(port)
-    update_cfg_badge()
-    update_conn_ui()
+    set_board(None)
+    update_mode_ui(force=True)
     refresh_readouts()
-    log("Ready. Console accepts Pico commands plus ports / connect / disconnect / clear.  Type 'help'.", "info")
+    log("Ready. Console accepts board commands plus ports / connect / disconnect / clear.  Type 'help'.", "info")
     poll()
     root.mainloop()
 

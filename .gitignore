@@ -2,12 +2,12 @@
 __pycache__/
 *.pyc
 
-# PyInstaller build output
+# PyInstaller output
 build/
-
+dist/
 *.spec
-
-# Arduino IDE local exports
+*.exe
+# Arduino IDE exports
 *.hex
 *.elf
 *.bin
