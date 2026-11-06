@@ -29,7 +29,7 @@ The app works out which board it is talking to and labels everything accordingly
 
 ## Supported hardware
 
-| | Raspberry Pi Pico | Arduino Uno / Nano |
+| | Raspberry Pi Pico | Arduino Uno |
 |---|---|---|
 | Chip | RP2040 | ATmega328P |
 | Signal pin | **GP17** (physical pin 22) | **D9** |
