@@ -60,7 +60,6 @@ For RPI-RP2 drive to show up first you have to plug the pico in with the bootsel
 
 #### ARDUINO UNO
 
-**Arduino Uno**
 
 1. Open `firmware/uno/uno.ino` in the Arduino IDE. The `Servo` and `EEPROM` libraries come with it.
 2. Choose board **Arduino Uno**.
